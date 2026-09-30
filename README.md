@@ -39,7 +39,7 @@ bun run build
 
 - **Motor determinista, sin LLM.** Son reglas explícitas por patrón: crash loop, fallos de autenticación, heartbeats viejos, build skew y health vía proxy. Es reproducible, testeable, no necesita API keys y cada conclusión es auditable.
 - **La confianza se calcula, no se inventa.** Es `prior + Σ pesos a favor − Σ pesos en contra`, y la UI muestra el peso de cada evidencia.
-- **"Ahora" = último evento observado** (`asOf`), no el reloj real, porque los datos son históricos.
+- **El análisis usa como "ahora" el último evento observado** (`asOf`), porque los datos son históricos. La interfaz sí es en vivo: el tiempo abierto corre con el reloj real y el análisis se refresca cada 15 s (se puede pausar).
 - **Parsers puros y I/O aislado.** [`parse.ts`](lib/incident/parse.ts) y [`analyze.ts`](lib/incident/analyze.ts) no tocan el disco; solo [`load.ts`](lib/incident/load.ts) lee archivos. El contrato API ↔ UI vive en [`types.ts`](lib/incident/types.ts).
 - **Sin dependencias nuevas.** Los tests usan `bun test`, el runner integrado de Bun.
 

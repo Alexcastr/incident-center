@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type CSSProperties,
   type ReactNode,
 } from "react";
@@ -59,6 +60,9 @@ function normalize(raw: AnalyzeResponse): AnalyzeResponse {
     },
   };
 }
+
+// Cada cuánto se re-analiza solo mientras el modo en vivo está activo y la pestaña visible.
+const REFRESH_MS = 15_000;
 
 async function fetchAnalysis(signal: AbortSignal) {
   const res = await fetch("/api/analyze", { cache: "no-store", signal });
@@ -175,6 +179,27 @@ function formatDuration(ms: number) {
 }
 
 // Desfase de la señal respecto a la apertura del incidente: T+04:12, T−1:02:00.
+function formatAgo(ms: number) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `hace ${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `hace ${minutes} min`;
+  return `hace ${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+// Reloj compartido con resolución de 1 s; en el servidor devuelve null para no desincronizar la hidratación.
+function subscribeToClock(onTick: () => void) {
+  const id = setInterval(onTick, 1000);
+  return () => clearInterval(id);
+}
+const getClockSecond = () => Math.floor(Date.now() / 1000);
+const getServerClockSecond = () => null;
+
+function useNow() {
+  const second = useSyncExternalStore(subscribeToClock, getClockSecond, getServerClockSecond);
+  return second === null ? null : second * 1000;
+}
+
 function formatOffset(ms: number) {
   if (Number.isNaN(ms)) return "";
   const total = Math.round(Math.abs(ms) / 1000);
@@ -238,6 +263,7 @@ export default function IncidentCommandCenter() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyzedAt, setAnalyzedAt] = useState<number | null>(null);
+  const [live, setLive] = useState(true);
   const requestRef = useRef<AbortController | null>(null);
 
   const analyze = useCallback(() => {
@@ -262,6 +288,15 @@ export default function IncidentCommandCenter() {
     analyze();
     return () => requestRef.current?.abort();
   }, [analyze]);
+
+  // Auto-refresh silencioso: no atenúa la UI como el re-análisis manual.
+  useEffect(() => {
+    if (!live) return;
+    const id = setInterval(() => {
+      if (document.visibilityState === "visible") analyze();
+    }, REFRESH_MS);
+    return () => clearInterval(id);
+  }, [live, analyze]);
 
   const reanalyze = () => {
     setLoading(true);
@@ -289,6 +324,8 @@ export default function IncidentCommandCenter() {
           error={error}
           analyzedAt={analyzedAt}
           onReanalyze={reanalyze}
+          live={live}
+          onToggleLive={() => setLive((v) => !v)}
         />
       ) : loading ? (
         <LoadingState />
@@ -340,12 +377,16 @@ function Dashboard({
   error,
   analyzedAt,
   onReanalyze,
+  live,
+  onToggleLive,
 }: {
   data: AnalyzeResponse;
   loading: boolean;
   error: string | null;
   analyzedAt: number | null;
   onReanalyze: () => void;
+  live: boolean;
+  onToggleLive: () => void;
 }) {
   const { incident, signals, analysis } = data;
 
@@ -412,7 +453,14 @@ function Dashboard({
 
   return (
     <>
-      <Header incident={incident} loading={loading} analyzedAt={analyzedAt} onReanalyze={onReanalyze} />
+      <Header
+        incident={incident}
+        loading={loading}
+        analyzedAt={analyzedAt}
+        onReanalyze={onReanalyze}
+        live={live}
+        onToggleLive={onToggleLive}
+      />
 
       <main
         className={`flex min-h-0 flex-1 flex-col gap-4 p-4 transition-opacity duration-300 lg:px-6 lg:pb-5 ${
@@ -517,14 +565,19 @@ function Header({
   loading,
   analyzedAt,
   onReanalyze,
+  live,
+  onToggleLive,
 }: {
   incident: AnalyzeResponse["incident"];
   loading: boolean;
   analyzedAt: number | null;
   onReanalyze: () => void;
+  live: boolean;
+  onToggleLive: () => void;
 }) {
   const severity = severityStyle(incident.severity);
-  const duration = Date.parse(incident.asOf) - Date.parse(incident.openedAt);
+  const now = useNow();
+  const openedAt = Date.parse(incident.openedAt);
   return (
     <header className="flex flex-wrap items-center justify-between gap-x-8 gap-y-4 border-b border-white/[0.06] bg-black/40 px-4 py-3.5 backdrop-blur lg:px-6">
       <div className="min-w-0">
@@ -553,27 +606,50 @@ function Header({
 
       <div className="flex items-center gap-6">
         <div className="text-right">
-          <div className="text-xs text-zinc-500">Duración observada</div>
+          <div className="text-xs text-zinc-500">Tiempo abierto</div>
           <div className="font-mono text-2xl font-semibold leading-tight tabular-nums text-zinc-50">
-            {Number.isNaN(duration) ? "--:--:--" : formatDuration(duration)}
+            {now === null || Number.isNaN(openedAt) ? "--:--:--" : formatDuration(now - openedAt)}
           </div>
-          <div className="font-mono text-[11px] text-zinc-500">
-            {formatTime(incident.openedAt)} → {formatTime(incident.asOf)}
+          <div
+            className="font-mono text-[11px] text-zinc-500"
+            title="Ventana de evidencia: del primer síntoma al último evento observado"
+          >
+            Evidencia {formatTime(incident.openedAt)} → {formatTime(incident.asOf)}
           </div>
         </div>
         <div className="h-12 w-px bg-white/10" />
         <div className="flex flex-col items-end gap-1.5">
-          <button
-            type="button"
-            onClick={onReanalyze}
-            disabled={loading}
-            className="inline-flex items-center gap-2 rounded-lg bg-cyan-400 px-3.5 py-2 text-sm font-semibold text-zinc-950 shadow-[0_0_24px_-6px_rgba(34,211,238,0.7)] transition hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-70"
-          >
-            <Icon name="refresh" className={`size-4 ${loading ? "animate-spin" : ""}`} />
-            {loading ? "Analizando…" : "Re-analizar"}
-          </button>
-          <span className="text-[11px] text-zinc-500">
-            Último análisis {analyzedAt ? formatLocalTime(analyzedAt) : "—"}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onToggleLive}
+              aria-pressed={live}
+              title={live ? "Pausar la actualización automática" : `Re-analizar cada ${REFRESH_MS / 1000} s`}
+              className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm ring-1 ring-inset transition ${
+                live
+                  ? "bg-emerald-400/10 text-emerald-200 ring-emerald-400/30 hover:bg-emerald-400/15"
+                  : "text-zinc-400 ring-white/10 hover:bg-white/5 hover:text-zinc-200"
+              }`}
+            >
+              <span className="relative flex size-2">
+                {live && <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400/70" />}
+                <span className={`relative inline-flex size-2 rounded-full ${live ? "bg-emerald-400" : "bg-zinc-500"}`} />
+              </span>
+              {live ? "En vivo" : "Pausado"}
+            </button>
+            <button
+              type="button"
+              onClick={onReanalyze}
+              disabled={loading}
+              className="inline-flex items-center gap-2 rounded-lg bg-cyan-400 px-3.5 py-2 text-sm font-semibold text-zinc-950 shadow-[0_0_24px_-6px_rgba(34,211,238,0.7)] transition hover:bg-cyan-300 disabled:cursor-wait disabled:opacity-70"
+            >
+              <Icon name="refresh" className={`size-4 ${loading ? "animate-spin" : ""}`} />
+              {loading ? "Analizando…" : "Re-analizar"}
+            </button>
+          </div>
+          <span className="text-[11px] text-zinc-500" title={analyzedAt ? `Último análisis ${formatLocalTime(analyzedAt)}` : undefined}>
+            {analyzedAt && now !== null ? `Actualizado ${formatAgo(now - analyzedAt)}` : "Sin análisis"}
+            {live ? `, se actualiza cada ${REFRESH_MS / 1000} s` : ", actualización pausada"}
           </span>
         </div>
       </div>
