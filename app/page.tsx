@@ -6,58 +6,21 @@ import {
   useMemo,
   useRef,
   useState,
-  useSyncExternalStore,
   type CSSProperties,
   type ReactNode,
 } from "react";
 
-// ─── Contrato esperado de GET /api/analyze ───────────────────────────────────
-
-type Severity = "critical" | "high" | "medium" | "low" | "info";
-
-type Signal = {
-  id: string;
-  timestamp: string; // ISO 8601
-  source: string; // "metrics", "logs", "deploys", ...
-  severity: Severity;
-  message: string;
-};
-
-type Evidence = { signalId: string; note: string };
-
-type Hypothesis = {
-  id: string;
-  title: string;
-  description?: string;
-  confidence: number; // 0–1 (también se acepta 0–100)
-  evidenceFor: Evidence[];
-  evidenceAgainst: Evidence[];
-};
-
-type Contradiction = { description: string; signalIds: string[] };
-
-type Action = {
-  id: string;
-  description: string;
-  priority: number; // 1 = máxima
-  requiresApproval: boolean;
-  owner?: string;
-  rationale?: string;
-};
-
-type AnalyzeResponse = {
-  incident: { id: string; title: string; severity: Severity; openedAt: string };
-  signals: Signal[];
-  analysis: {
-    summary: string;
-    impact: string;
-    hypotheses: Hypothesis[];
-    misleadingSignals: { signalId: string; reason: string }[];
-    contradictions: Contradiction[];
-    actions: Action[];
-    followUp: string[];
-  };
-};
+import type {
+  Action,
+  AnalyzeResponse,
+  Certainty,
+  Evidence,
+  Finding,
+  Hypothesis,
+  Impact,
+  Severity,
+  Signal,
+} from "@/lib/incident/types";
 
 // Ordena y rellena listas faltantes para que la UI no se rompa si el backend omite algo.
 function normalize(raw: AnalyzeResponse): AnalyzeResponse {
@@ -70,7 +33,15 @@ function normalize(raw: AnalyzeResponse): AnalyzeResponse {
     ),
     analysis: {
       summary: a.summary ?? "",
-      impact: a.impact ?? "",
+      impact: a.impact ?? {
+        summary: "",
+        certainty: "verify",
+        seatsTotal: 0,
+        seatsAffected: 0,
+        activeCallsAtRisk: [],
+        agencies: [],
+      },
+      findings: a.findings ?? [],
       hypotheses: (a.hypotheses ?? [])
         .map((h) => ({
           ...h,
@@ -91,8 +62,9 @@ function normalize(raw: AnalyzeResponse): AnalyzeResponse {
 
 async function fetchAnalysis(signal: AbortSignal) {
   const res = await fetch("/api/analyze", { cache: "no-store", signal });
-  if (!res.ok) throw new Error(`La API respondió ${res.status}`);
-  return normalize(await res.json());
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(body?.error ?? `La API respondió ${res.status}`);
+  return normalize(body);
 }
 
 // ─── Estilos y formato ───────────────────────────────────────────────────────
@@ -143,28 +115,54 @@ const SOURCE_PALETTE: SourceStyle[] = [
 ];
 
 const SOURCE_LABELS: Record<string, string> = {
-  metrics: "Métricas",
-  logs: "Logs",
-  alerts: "Alertas",
-  deploys: "Deploys",
-  traces: "Trazas",
-  support: "Soporte",
+  server: "Servidor",
+  deploy: "Deploy",
+  carrier: "Carriers",
+  heartbeats: "Heartbeats",
 };
 
 const sourceLabel = (source: string) =>
   SOURCE_LABELS[source.toLowerCase()] ?? source.charAt(0).toUpperCase() + source.slice(1);
 
-const timeFormat = new Intl.DateTimeFormat("es-ES", {
+const TIME_OPTIONS: Intl.DateTimeFormatOptions = {
   hour: "2-digit",
   minute: "2-digit",
   second: "2-digit",
   hour12: false,
-});
+};
+// Los datos del incidente se muestran en UTC (así se correlacionan); las acciones del usuario, en hora local.
+const utcFormat = new Intl.DateTimeFormat("es-ES", { ...TIME_OPTIONS, timeZone: "UTC" });
+const localFormat = new Intl.DateTimeFormat("es-ES", TIME_OPTIONS);
 
-function formatTime(value: string | number) {
+function formatTime(value: string | number, format = utcFormat) {
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "—" : timeFormat.format(date);
+  if (Number.isNaN(date.getTime())) return "—";
+  return format === utcFormat ? `${format.format(date)}Z` : format.format(date);
 }
+
+const formatLocalTime = (value: number) => formatTime(value, localFormat);
+
+// El marcador codifica la certeza: lleno = hecho, mitad = inferencia, vacío = por verificar.
+const CERTAINTY: Record<Certainty, { label: string; marker: string; tone: string; hint: string }> = {
+  known: {
+    label: "Sabemos",
+    marker: "bg-current",
+    tone: "text-sky-300",
+    hint: "Observado directamente en una fuente",
+  },
+  inferred: {
+    label: "Inferimos",
+    marker: "bg-[linear-gradient(90deg,currentColor_50%,transparent_50%)]",
+    tone: "text-violet-300",
+    hint: "Conclusión razonada a partir de varias señales",
+  },
+  verify: {
+    label: "Por verificar",
+    marker: "",
+    tone: "text-amber-300",
+    hint: "Falta confirmarlo antes de actuar",
+  },
+};
 
 const pad = (n: number) => String(n).padStart(2, "0");
 
@@ -446,11 +444,9 @@ function Dashboard({
           />
 
           <div className={`flex min-h-0 flex-col gap-4 lg:overflow-y-auto lg:pr-1 ${SCROLL}`}>
-            <Panel
-              index="01"
-              title="Hipótesis"
-              meta={`${analysis.hypotheses.length} evaluadas · por confianza`}
-            >
+            <KnowledgePanel findings={analysis.findings} signalLink={signalLink} />
+
+            <Panel title="Hipótesis de causa" meta={`${analysis.hypotheses.length}, ordenadas por confianza`}>
               {analysis.hypotheses.length === 0 ? (
                 <Empty>Sin hipótesis.</Empty>
               ) : (
@@ -469,7 +465,9 @@ function Dashboard({
               )}
             </Panel>
 
-            <Panel index="02" title="Contradicciones detectadas" meta={`${analysis.contradictions.length}`}>
+            <ActionsPanel actions={analysis.actions} approvals={approvals} onApprove={approve} />
+
+            <Panel title="Contradicciones" meta={`${analysis.contradictions.length} detectadas`}>
               {analysis.contradictions.length === 0 ? (
                 <Empty>No se detectaron contradicciones.</Empty>
               ) : (
@@ -491,20 +489,18 @@ function Dashboard({
               )}
             </Panel>
 
-            <ActionsPanel actions={analysis.actions} approvals={approvals} onApprove={approve} />
-
-            <Panel index="04" title="Follow-up post-incidente" meta={`${analysis.followUp.length} tareas`}>
+            <Panel title="Follow-up post-incidente" meta={`${analysis.followUp.length} tareas`}>
               {analysis.followUp.length === 0 ? (
                 <Empty>Sin tareas de seguimiento.</Empty>
               ) : (
-                <ol className="space-y-2.5 px-4 py-3.5">
+                <ul className="space-y-2.5 px-4 py-3.5">
                   {analysis.followUp.map((item, i) => (
                     <li key={i} className="flex gap-3 text-[13px] leading-snug text-zinc-300">
-                      <span className="mt-px font-mono text-[11px] text-zinc-600">{pad(i + 1)}</span>
+                      <span className="mt-[7px] size-1.5 shrink-0 rounded-full bg-zinc-600" />
                       {item}
                     </li>
                   ))}
-                </ol>
+                </ul>
               )}
             </Panel>
           </div>
@@ -528,17 +524,18 @@ function Header({
   onReanalyze: () => void;
 }) {
   const severity = severityStyle(incident.severity);
+  const duration = Date.parse(incident.asOf) - Date.parse(incident.openedAt);
   return (
     <header className="flex flex-wrap items-center justify-between gap-x-8 gap-y-4 border-b border-white/[0.06] bg-black/40 px-4 py-3.5 backdrop-blur lg:px-6">
       <div className="min-w-0">
-        <div className="flex items-center gap-2.5 text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500">
+        <div className="flex items-center gap-2.5 text-xs text-zinc-500">
           <span className="relative flex size-2">
             <span className="absolute inline-flex size-full animate-ping rounded-full bg-red-500/70" />
             <span className="relative inline-flex size-2 rounded-full bg-red-500" />
           </span>
-          <span className="text-red-400">Incidente activo</span>
+          <span className="font-medium text-red-400">Incidente activo</span>
           <span className="text-zinc-700">/</span>
-          <span>Centro de comando</span>
+          <span className="font-mono">{incident.service}</span>
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
           <span className="rounded-md bg-white/[0.06] px-2 py-0.5 font-mono text-sm font-medium text-zinc-300 ring-1 ring-inset ring-white/10">
@@ -546,21 +543,23 @@ function Header({
           </span>
           <h1 className="text-xl font-semibold tracking-tight text-zinc-50">{incident.title}</h1>
           <span
-            className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-bold uppercase tracking-wider ring-1 ring-inset ${severity.badge}`}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-semibold ring-1 ring-inset ${severity.badge}`}
           >
             <span className={`size-1.5 rounded-full ${severity.dot}`} />
-            Severidad {severity.label}
+            Severidad {severity.label.toLowerCase()}
           </span>
         </div>
       </div>
 
       <div className="flex items-center gap-6">
         <div className="text-right">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.22em] text-zinc-500">
-            Tiempo transcurrido
+          <div className="text-xs text-zinc-500">Duración observada</div>
+          <div className="font-mono text-2xl font-semibold leading-tight tabular-nums text-zinc-50">
+            {Number.isNaN(duration) ? "--:--:--" : formatDuration(duration)}
           </div>
-          <ElapsedTimer since={incident.openedAt} />
-          <div className="text-[11px] text-zinc-500">Abierto a las {formatTime(incident.openedAt)}</div>
+          <div className="font-mono text-[11px] text-zinc-500">
+            {formatTime(incident.openedAt)} → {formatTime(incident.asOf)}
+          </div>
         </div>
         <div className="h-12 w-px bg-white/10" />
         <div className="flex flex-col items-end gap-1.5">
@@ -573,8 +572,8 @@ function Header({
             <Icon name="refresh" className={`size-4 ${loading ? "animate-spin" : ""}`} />
             {loading ? "Analizando…" : "Re-analizar"}
           </button>
-          <span className="font-mono text-[11px] text-zinc-500">
-            Último análisis {analyzedAt ? formatTime(analyzedAt) : "—"}
+          <span className="text-[11px] text-zinc-500">
+            Último análisis {analyzedAt ? formatLocalTime(analyzedAt) : "—"}
           </span>
         </div>
       </div>
@@ -582,41 +581,98 @@ function Header({
   );
 }
 
-// Reloj compartido con resolución de 1 s; en el servidor devuelve null para no desincronizar la hidratación.
-function subscribeToClock(onTick: () => void) {
-  const id = setInterval(onTick, 1000);
-  return () => clearInterval(id);
-}
-const getClockSecond = () => Math.floor(Date.now() / 1000);
-const getServerClockSecond = () => null;
-
-function ElapsedTimer({ since }: { since: string }) {
-  const nowSecond = useSyncExternalStore(subscribeToClock, getClockSecond, getServerClockSecond);
-  const start = Date.parse(since);
-  return (
-    <div className="font-mono text-2xl font-semibold leading-tight tabular-nums text-zinc-50">
-      {nowSecond === null || Number.isNaN(start) ? "--:--:--" : formatDuration(nowSecond * 1000 - start)}
-    </div>
-  );
-}
-
-function DiagnosisBanner({ summary, impact }: { summary: string; impact: string }) {
+function DiagnosisBanner({ summary, impact }: { summary: string; impact: Impact }) {
+  const certainty = CERTAINTY[impact.certainty];
   return (
     <section className="relative overflow-hidden rounded-xl border border-cyan-400/20 bg-linear-to-r from-cyan-500/[0.09] via-[#0b0f15]/90 to-[#0b0f15]/90">
       <div className="absolute inset-y-0 left-0 w-1 bg-cyan-400 shadow-[0_0_16px_rgba(34,211,238,0.8)]" />
-      <div className="grid gap-4 p-4 pl-6 lg:grid-cols-[minmax(0,1.7fr)_minmax(0,1fr)]">
+      <div className="grid gap-4 p-4 pl-6 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
         <div>
-          <h2 className="text-[10px] font-semibold uppercase tracking-[0.22em] text-cyan-300">Diagnóstico</h2>
-          <p className="mt-1.5 text-[15px] leading-relaxed text-zinc-100">{summary || "—"}</p>
+          <h2 className="text-sm font-semibold text-cyan-300">Causa probable</h2>
+          <p className="mt-1.5 max-w-[80ch] text-[15px] leading-relaxed text-zinc-100">{summary || "—"}</p>
         </div>
         <div className="rounded-lg border border-red-500/25 bg-red-500/[0.07] px-4 py-3">
-          <h2 className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.22em] text-red-300">
-            <Icon name="warning" className="size-3" /> Impacto
+          <h2 className="flex items-center gap-2 text-sm font-semibold text-red-300">
+            <Icon name="warning" className="size-3.5" /> Impacto en usuarios
+            <span className={`ml-auto inline-flex items-center gap-1.5 text-xs font-normal ${certainty.tone}`} title={certainty.hint}>
+              <CertaintyMarker certainty={impact.certainty} /> {certainty.label.toLowerCase()}
+            </span>
           </h2>
-          <p className="mt-1.5 text-sm leading-relaxed text-red-50/90">{impact || "—"}</p>
+          <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-2">
+            <p>
+              <span className="font-mono text-2xl font-semibold tabular-nums text-red-50">
+                {impact.seatsAffected}
+                <span className="text-base text-red-200/60">/{impact.seatsTotal}</span>
+              </span>
+              <span className="ml-2 text-xs text-red-100/80">seats sin conexión</span>
+            </p>
+            <p>
+              <span className="font-mono text-2xl font-semibold tabular-nums text-red-50">
+                {impact.activeCallsAtRisk.length}
+              </span>
+              <span className="ml-2 text-xs text-red-100/80">
+                llamadas activas en riesgo{impact.activeCallsAtRisk.length ? ` (${impact.activeCallsAtRisk.join(", ")})` : ""}
+              </span>
+            </p>
+          </div>
+          <p className="mt-1.5 text-xs leading-relaxed text-red-100/70">
+            {impact.agencies.map((a) => `${a.name}: ${a.affected}/${a.total}`).join(", ")}
+          </p>
         </div>
       </div>
     </section>
+  );
+}
+
+function CertaintyMarker({ certainty }: { certainty: Certainty }) {
+  return (
+    <span
+      aria-hidden
+      className={`inline-block size-2.5 shrink-0 rounded-full border-[1.5px] border-current ${CERTAINTY[certainty].marker}`}
+    />
+  );
+}
+
+function KnowledgePanel({
+  findings,
+  signalLink,
+}: {
+  findings: Finding[];
+  signalLink: (id: string) => ReactNode;
+}) {
+  return (
+    <Panel title="Qué sabemos y qué no" meta="Cada afirmación enlaza a su evidencia">
+      <div className="grid gap-px bg-white/[0.05] xl:grid-cols-3">
+        {(Object.keys(CERTAINTY) as Certainty[]).map((certainty) => {
+          const style = CERTAINTY[certainty];
+          const items = findings.filter((f) => f.certainty === certainty);
+          return (
+            <div key={certainty} className="bg-[#0b0f15] px-4 py-3">
+              <h3 className={`flex items-center gap-2 text-sm font-semibold ${style.tone}`}>
+                <CertaintyMarker certainty={certainty} />
+                {style.label}
+                <span className="font-mono text-xs font-normal text-zinc-500">{items.length}</span>
+              </h3>
+              <p className="mt-0.5 text-[11px] text-zinc-500">{style.hint}</p>
+              {items.length === 0 ? (
+                <p className="mt-3 text-xs text-zinc-600">Nada en esta categoría.</p>
+              ) : (
+                <ul className="mt-3 space-y-3">
+                  {items.map((f) => (
+                    <li key={f.id} className="text-[12.5px] leading-snug text-zinc-300">
+                      {f.statement}
+                      {f.signalIds.length > 0 && (
+                        <span className="mt-1.5 flex flex-wrap gap-1">{f.signalIds.map(signalLink)}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
   );
 }
 
@@ -650,13 +706,12 @@ function Timeline({
   return (
     <section className={`${PANEL} flex max-h-[42rem] min-h-0 flex-col lg:max-h-none`}>
       <PanelHeader
-        index="00"
         title="Timeline de señales"
         meta={`${visible.length} de ${signals.length} · ${misleading.size} engañosas`}
       />
 
       <div className="flex flex-wrap items-center gap-1.5 border-b border-white/[0.06] px-4 py-2.5">
-        <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-zinc-600">Fuente</span>
+        <span className="mr-1 text-xs text-zinc-500">Fuente</span>
         <FilterChip active={selectedSources.size === 0} onClick={onShowAll} label="Todas" count={signals.length} />
         {[...sourceStyles].map(([source, style]) => (
           <FilterChip
@@ -778,7 +833,15 @@ function SignalItem({
           )}
         </div>
         <p className="mt-1.5 text-[13px] leading-snug text-zinc-200">{signal.message}</p>
-        <div className="mt-1 font-mono text-[10px] text-zinc-600">{signal.id}</div>
+        <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[10px] text-zinc-600">
+          <span className="text-zinc-500">{signal.id}</span>
+          <span>{signal.ref}</span>
+          {signal.originalTimestamp && (
+            <span className="text-sky-300/80" title="La fuente no estaba en UTC; se normalizó para correlacionar">
+              original {signal.originalTimestamp}
+            </span>
+          )}
+        </div>
 
         {isMisleading && (
           <div
@@ -903,6 +966,10 @@ function EvidenceList({
             <li key={`${e.signalId}-${i}`} className="text-xs leading-snug text-zinc-300">
               <span className="mr-1.5">{signalLink(e.signalId)}</span>
               {e.note}
+              <span className={`ml-1.5 font-mono text-[10px] ${isFor ? "text-emerald-400/70" : "text-rose-400/70"}`}>
+                {isFor ? "+" : "−"}
+                {e.weight.toFixed(2)}
+              </span>
             </li>
           ))}
         </ul>
@@ -948,8 +1015,7 @@ function ActionsPanel({
   const pending = actions.filter((a) => a.requiresApproval && !approvals[a.id]).length;
   return (
     <Panel
-      index="03"
-      title="Acciones recomendadas"
+      title="Siguiente paso seguro"
       meta={
         pending > 0 ? (
           <span className="text-amber-300">{pending} pendientes de aprobación</span>
@@ -996,7 +1062,7 @@ function ActionsPanel({
                   ) : approvedAt ? (
                     <span className="inline-flex items-center gap-1.5 rounded-md bg-emerald-500/15 px-2.5 py-1.5 text-xs font-semibold text-emerald-300 ring-1 ring-inset ring-emerald-500/40">
                       <Icon name="check" />
-                      Aprobada · <span className="font-mono tabular-nums">{formatTime(approvedAt)}</span>
+                      Aprobada a las <span className="font-mono tabular-nums">{formatLocalTime(approvedAt)}</span>
                     </span>
                   ) : (
                     <button
@@ -1021,31 +1087,26 @@ function ActionsPanel({
 // ─── Piezas compartidas ──────────────────────────────────────────────────────
 
 function Panel({
-  index,
   title,
   meta,
   children,
 }: {
-  index: string;
   title: string;
   meta?: ReactNode;
   children: ReactNode;
 }) {
   return (
     <section className={`${PANEL} shrink-0`}>
-      <PanelHeader index={index} title={title} meta={meta} />
+      <PanelHeader title={title} meta={meta} />
       {children}
     </section>
   );
 }
 
-function PanelHeader({ index, title, meta }: { index: string; title: string; meta?: ReactNode }) {
+function PanelHeader({ title, meta }: { title: string; meta?: ReactNode }) {
   return (
     <div className="flex items-baseline justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
-      <h2 className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-300">
-        <span className="font-mono text-cyan-400/70">{index}</span>
-        {title}
-      </h2>
+      <h2 className="text-sm font-semibold text-zinc-100">{title}</h2>
       {meta && <span className="text-xs text-zinc-500">{meta}</span>}
     </div>
   );
